@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -8,6 +8,7 @@ using System.Reflection;
 using System.Collections;
 using System.Xml.Linq;
 using static System.IdentityModel.Tokens.SecurityTokenHandlerCollectionManager;
+using Microsoft.Crm.Sdk.Messages;
 
 namespace ProjectImports
 {
@@ -31,10 +32,19 @@ namespace ProjectImports
             // step 2. A process must be turned off to prevent field deletion "DAI - On Project Create Map Over Key Fields"
             // step 3. ensure  filename is set to correct file.
             // *******************************************************************************
-            // LoadProjectsFromExcel();
+            //LoadProjectsFromExcel();
 
             // Update Opportunity DAI Connect Link
-            UpdateOpportunitiesFromExcel();
+            // UpdateOpportunitiesFromExcel();
+
+            // Remove Duplicate Questions from Proposals
+            // RemoveDuplicateQuestionsFromProposals();
+
+            // Delete Unmanaged Solutions
+            RemoveUnmanagedSolutionsFromEnvironment();
+
+            // Update Custom Question Responses
+            // UpdateAllCustomQuestionResponses();
             
         }
         public static void LoadProjectsFromExcel()
@@ -61,13 +71,32 @@ namespace ProjectImports
 
             Log<Program>.Logger.Info("Update Opportunities Completed");
         }
+        public static void RemoveDuplicateQuestionsFromProposals()
+        {
+            Log<Program>.Logger.Info("Remove Duplicate Questions Started");
+            DeleteDuplicateCustomQuestions();
+            Log<Program>.Logger.Info("Remove Duplicate Questions Completed");
+        }
+        public static void RemoveUnmanagedSolutionsFromEnvironment()
+        {
+            Log<Program>.Logger.Info("Remove Unmanaged Solutions Started");
+            DeleteUnmanagedSolutions();
+            Log<Program>.Logger.Info("Remove Unmanaged Solutions Completed");
+        }
+
+        public static void UpdateAllCustomQuestionResponses()
+        {
+            Log<Program>.Logger.Info("Update Custom Question Responses Started");
+            UpdateResponseCustomQuestionResponses();
+            Log<Program>.Logger.Info("Update Custom Question Responses Completed");
+        }
 
         static List<Project> LoadFromExcel()
         {
-            string filePath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) + @"\Files\CRM Project Upload Template (version 1)_MSP.xlsx";
+            string filePath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) + @"\Files\CRM Project Upload Template (version 1)_MSP(2).xlsx";
             Application excelApp = new Application();
             Workbook excelWorkbook = excelApp.Workbooks.Open(filePath);
-            Worksheet excelWorksheet = excelWorkbook.Sheets[1]; // assuming data is in first sheet
+            Worksheet excelWorksheet = excelWorkbook.Sheets[7]; // 1, assuming data is in first sheet
             Range excelRange = excelWorksheet.UsedRange;
             Log<Program>.Logger.Info(string.Format("{0} - {1} rows.", excelWorksheet.Name, excelRange.Rows.Count));
             List<Project> projects = new List<Project>();
@@ -429,6 +458,297 @@ namespace ProjectImports
                 }
                 
             }
+        }
+        static void DeleteDuplicateCustomQuestions()
+        {
+            // get all proposals that have a solicitation
+            string query = 
+                    "<fetch>" +
+                        "<entity name='cdr_contractapplication'>" +
+                            "<attribute name='cdr_contractapplicationid' />" +
+                            "<attribute name='cdr_name' />" +
+                            "<filter type='and'>" +
+                                "<condition attribute='dai_solicitationid' operator='not-null' />" +
+                                "<condition attribute='statecode' operator='eq' value='0'/>" +
+                            "</filter>" +
+                        "</entity>" +
+                    "</fetch>";
+            EntityCollection proposals = DynamicsHelper.FetchXmlQuery(query);
+
+            Log<Program>.Logger.InfoFormat("Found {0} proposals with solicitations", proposals.Entities.Count);
+            
+            // for each proposal, get all custom questions
+            foreach (Entity proposal in proposals.Entities)
+            {
+                // get all custom questions for proposal
+                string query2 =
+                        "<fetch>" +
+                            "<entity name='gm_grantperformancecriterion'>" +
+                                "<attribute name='gm_name' />" +
+                                "<attribute name='gm_metrictype' />" +
+                                "<attribute name='gm_displayorder' />" +
+                                "<attribute name='cdr_yesnorespactual' />" +
+                                "<attribute name='cdr_wholerespactual' />" +
+                                "<attribute name='cdr_commentactual' />" +
+                                "<attribute name='cdr_applicationcontract' />" +
+                                "<attribute name='isi_concept' />" +
+                                "<attribute name='isi_optionsetresponse' />" +
+                                "<attribute name='gm_floatnumberresponse' />" +
+                                "<attribute name='gm_grantperformancecriterionid' />" +
+                                "<attribute name= 'isi_answered' />" +
+                                "<filter type='and'>" +
+                                "<condition attribute='statecode' operator='eq' value='0' />" +
+                                "</filter>" +
+                                "<link-entity name='cdr_contractapplication' from='cdr_contractapplicationid' to='cdr_applicationcontract' link-type='inner' alias='ac'>" +
+                                "<filter type='and'>" +
+                                    "<condition attribute='cdr_contractapplicationid' operator='eq' uitype='cdr_contractapplication' value='" + proposal.GetAttributeValue<Guid>("cdr_contractapplicationid").ToString() + "' />" +
+                                "</filter>" +
+                                "</link-entity>" +
+                            "</entity>" +
+                        "</fetch>";
+                EntityCollection customQuestions = DynamicsHelper.FetchXmlQuery(query2);
+                Log<Program>.Logger.InfoFormat("Found {0} custom questions for proposal {1}", customQuestions.Entities.Count, proposal.GetAttributeValue<string>("cdr_name"));
+                // for each custom question, check for duplicates and delete
+                foreach (Entity customQuestion in customQuestions.Entities)
+                {
+                    //check for duplicates
+                    List<Entity> duplicates = customQuestions.Entities.Where(x => x.GetAttributeValue<string>("gm_name") == customQuestion.GetAttributeValue<string>("gm_name")).ToList();
+                    //if duplicates exist, log them
+                    
+                    if (duplicates.Count > 1)
+                    {
+                        Log<Program>.Logger.InfoFormat("Found {0} duplicates for custom question {1} in proposal {2}", duplicates.Count, customQuestion.GetAttributeValue<string>("gm_name"), proposal.GetAttributeValue<string>("cdr_name"));
+                        //delete duplicate question where answered = false
+                        for (int i = 1; i < duplicates.Count; i++)
+                        {
+                            if (duplicates[i].GetAttributeValue<bool>("isi_answered") == false)
+                            {
+                                string duplicateQuestion = duplicates[i].GetAttributeValue<string>("gm_name");
+                                
+
+                                try
+                                {
+                                    DynamicsHelper.Delete("gm_grantperformancecriterion", duplicates[i].Id);
+                                }
+                                catch (System.ServiceModel.FaultException e)
+                                {
+                                    Log<Program>.Logger.InfoFormat("Error deleting duplicate custom question {0} in proposal {1} duplicates count = {2}", duplicateQuestion, proposal.GetAttributeValue<string>("cdr_name"), duplicates.Count);
+                                    Log<Program>.Logger.Info(e.Message);
+                                }
+                                catch (Exception ex)
+                                {
+                                   
+                                    throw;
+                                }
+                                
+                                Log<Program>.Logger.InfoFormat("Deleted duplicate custom question {0} in proposal {1} duplicates count = {2}", duplicateQuestion, proposal.GetAttributeValue<string>("cdr_name"), duplicates.Count) ;
+                            }
+                        }
+                    }
+
+                }
+            }  
+        }
+        static void DeleteUnmanagedSolutions()
+        {
+            // get all unmanaged solutions
+            string query = 
+                    "<fetch>" +
+                        "<entity name='solution'>" +
+                            "<attribute name='friendlyname' />" +
+                            "<attribute name='version' />" +
+                            "<attribute name='solutionid' />" +
+                            "attribute name='uniquename' />" +
+                            "<filter type='and'>" +
+                                "<condition attribute='ismanaged' operator='eq' value='0' />" +
+                                "<condition attribute='isvisible' operator='eq' value='1' />" +
+                                "<condition attribute='uniquename' operator='not-like' value='Default%' />" +
+                                //"<condition attribute='modifiedon' operator='lt' value='" + DateTime.Now.AddMonths(-1).ToString("yyyy-MM-dd") + "' />" +
+                                "<condition attribute='uniquename' operator='not-like' value='WO%' />" +
+                            "</filter>" +
+                        "</entity>" +
+                    "</fetch>";
+            EntityCollection solutions = DynamicsHelper.FetchXmlQuery(query);
+
+            Log<Program>.Logger.InfoFormat("Found {0} unmanaged solutions", solutions.Entities.Count);
+            
+            // for each solution, delete
+            foreach (Entity solution in solutions.Entities)
+            {
+                //user input to confirm deletion (comment out to run without confirmation)
+                // Log<Program>.Logger.InfoFormat("Delete unmanaged solution {0} (y/n)?", solution.GetAttributeValue<string>("friendlyname"));
+                // string input = Console.ReadLine();
+                // if (input != "y") continue;
+
+                try
+                {
+                    DynamicsHelper.Delete("solution", solution.Id);
+                    Log<Program>.Logger.InfoFormat("Deleted unmanaged solution {0}", solution.GetAttributeValue<string>("friendlyname"));
+                }
+                catch (System.ServiceModel.FaultException e)
+                {
+                    Log<Program>.Logger.InfoFormat("Error deleting unmanaged solution {0}", solution.GetAttributeValue<string>("friendlyname"));
+                    Log<Program>.Logger.Info(e.Message);
+                }
+                catch (Exception ex)
+                {
+                    throw;
+                }
+            }
+        }
+        static void UpdateResponseCustomQuestionResponses()
+        {
+            // retrieve all custom questions
+            string query = 
+                    "<fetch>" +
+                        "<entity name='gm_grantperformancecriterion'>" +
+                            "<attribute name='gm_name' />" +
+                            "<attribute name='gm_metrictype' />" +
+                            "<attribute name='gm_displayorder' />" +
+                            "<attribute name='cdr_yesnorespactual' />" +
+                            "<attribute name='cdr_wholerespactual' />" +
+                            "<attribute name='cdr_commentactual' />" +
+                            "<attribute name='cdr_applicationcontract' />" +
+                            "<attribute name='isi_concept' />" +
+                            "<attribute name='isi_optionsetresponse' />" +
+                            "<attribute name='gm_floatnumberresponse' />" +
+                            "<attribute name='gm_grantperformancecriterionid' />" +
+                            "<attribute name='isi_percentageresponse' />" +
+                            "<attribute name= 'isi_answered' />" +
+                            "<filter type='and'>" +
+                            "<condition attribute='statecode' operator='eq' value='0' />" +
+                            "<condition attribute='isi_answered' operator='eq' value='true' />" +
+                            "<condition attribute='gm_metrictype' operator='eq' value='930660002' />" +
+                            "</filter>" +
+                        "</entity>" +
+                    "</fetch>";
+            EntityCollection customQuestions = DynamicsHelper.FetchXmlQuery(query);
+            Log<Program>.Logger.InfoFormat("Found {0} custom questions", customQuestions.Entities.Count);
+            // for each custom question check metrictype and update response
+            foreach (Entity customQuestion in customQuestions.Entities)
+            {
+
+                string newResponse = "";
+                // switch on gm_metrictype
+                switch (customQuestion.GetAttributeValue<OptionSetValue>("gm_metrictype").Value)
+                {
+                    case 100000000: // Text Only
+                        if (customQuestion.GetAttributeValue<string>("cdr_commentactual") != null)
+                        {
+                            newResponse = customQuestion.GetAttributeValue<string>("cdr_commentactual");
+                            // if newResponse is more than 4000 characters, truncate
+                            if (newResponse.Length > 4000)
+                            {
+                                newResponse = newResponse.Substring(0, 4000);
+                            }
+                        }
+                        break;
+                    case 605730000: // Option Set Single
+                        if (customQuestion.GetAttributeValue<EntityReference>("isi_optionsetresponse") != null)
+                        {
+                            newResponse = customQuestion.GetAttributeValue<EntityReference>("isi_optionsetresponse").Name;
+                        }
+                        break;
+                    case 930660002: // Yes/No 
+                        if (customQuestion.GetAttributeValue<bool>("cdr_yesnorespactual").Equals(true))
+                        {
+                            newResponse = "Yes";
+                        }
+                        else
+                        {
+                            newResponse = "No";
+                        }
+                        break;
+                    case 930660000: // Whole Number
+                            newResponse = customQuestion.GetAttributeValue<int>("cdr_wholerespactual").ToString();
+                        break;
+                    case 930660001: // Decimal Number
+                        
+                        if (customQuestion.FormattedValues.ContainsKey("gm_floatnumberresponse"))
+                        {
+                            newResponse = customQuestion.FormattedValues["gm_floatnumberresponse"];
+                        }
+                          
+                            
+                        break;
+                    case 605730001: // Percentage
+                            newResponse = customQuestion.GetAttributeValue<int>("isi_percentageresponse").ToString();
+                        break;
+                    case 930660004: // Country single select
+                        if (customQuestion.GetAttributeValue<EntityReference>("cdr_countryresponse") != null)
+                        {
+                            newResponse = customQuestion.GetAttributeValue<EntityReference>("cdr_countryresponse").Name;
+                        }
+                        break;
+                    case 930660005: // Country multi select
+                        // get all countries related to the custom question
+                       string query2 = 
+                            "<fetch>" +
+                                "<entity name='plus_country'>" +
+                                    "<attribute name='plus_name' />" +
+                                    "<attribute name='plus_countryid' />" +
+                                    "<filter type='and'>" +
+                                        "<condition attribute='statecode' operator='eq' value='0' />" +
+                                    "</filter>" +
+                                    "<link-entity name='dai_gm_grantperformancecriterion_plus_count' from='plus_countryid' to='plus_countryid' visible='false' intersect='true'>" +
+                                        "<link-entity name='gm_grantperformancecriterion' from='gm_grantperformancecriterionid' to='gm_grantperformancecriterionid' alias='ab'>" +
+                                            "<filter type='and'>" +
+                                                "<condition attribute='gm_grantperformancecriterionid' operator='eq' uitype='gm_grantperformancecriterion' value='" + customQuestion.Id.ToString() + "' />" +
+                                            "</filter>" +
+                                        "</link-entity>" +
+                                    "</link-entity>" +
+                                "</entity>" +
+                            "</fetch>"; 
+                        EntityCollection countries = DynamicsHelper.FetchXmlQuery(query2);
+                        // build a comma separated string of country names
+                        foreach (Entity country in countries.Entities)
+                        {
+                            newResponse += country.GetAttributeValue<string>("plus_name") + ", ";
+                        }
+                        newResponse = newResponse.TrimEnd(',', ' ');
+                        break;
+                    case 930660003: // Option Set Multiple
+                        // get all metric option set responses related to the custom question
+                        string query3 = 
+                            "<fetch>" +
+                                "<entity name='isi_metricoptionsetanswer'>" +
+                                    "<attribute name='isi_metricoptionsetanswerid' />" +
+                                    "<attribute name='isi_name' />" +
+                                    "<link-entity name='dai_gm_grantperformancecriterion_isi_metric' from='isi_metricoptionsetanswerid' to='isi_metricoptionsetanswerid' visible='false' intersect='true'>" +
+                                        "<link-entity name='gm_grantperformancecriterion' from='gm_grantperformancecriterionid' to='gm_grantperformancecriterionid' alias='af'>" +
+                                            "<filter type='and'>" +
+                                                "<condition attribute='gm_grantperformancecriterionid' operator='eq' uitype='gm_grantperformancecriterion' value='" + customQuestion.Id.ToString() + "' />" +
+                                            "</filter>" +
+                                        "</link-entity>" +
+                                    "</link-entity>" +
+                                "</entity>" +
+                            "</fetch>";
+                        EntityCollection responses = DynamicsHelper.FetchXmlQuery(query3);
+                        // build a comma separated string of response names 
+                        foreach (Entity response in responses.Entities)
+                        {
+                            newResponse += response.GetAttributeValue<string>("isi_name") + ", ";
+                        }
+                        newResponse = newResponse.TrimEnd(',', ' ');
+                        break;
+                    default:
+                        break;
+                }
+                if (newResponse != "")
+                {
+                    try
+                    {
+                        customQuestion["dai_response"] = newResponse;
+                        DynamicsHelper.Update(customQuestion);
+                        Log<Program>.Logger.InfoFormat("Updated response for custom question {0} to {1}", customQuestion.GetAttributeValue<string>("gm_name"), newResponse);
+                    }
+                    catch ( Exception e)
+                    {
+                        var temp = e.Message;
+                    }
+                }
+            }
+
         }
     }
 }
